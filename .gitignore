@@ -1,0 +1,48 @@
+# Unity generated folders
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+.utmp/
+[Uu]ser[Ll]og/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+
+# Unity generated files
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+*.apk
+*.aab
+*.unitypackage
+*.app
+
+# Crash reports / logs
+sysinfo.txt
+*.stackdump
+
+# Build / local machine artifacts
+build_output.log
+probe_output.log
+acs.log
+*.log
+fish_editor_*.png
+
+# Personal / unrelated local files
+Preparation_COPROJ_2026-09.xlsx
+generer_prepa_coproj.py
+UNITY_WORKSPACE.md
