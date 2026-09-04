@@ -1,11 +1,25 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 public sealed class HelloAndroid : MonoBehaviour
 {
     private const int WaterWidth = 112;
     private const int WaterHeight = 192;
-    private const int BubbleCount = 18;
+    private const int BubbleCount = 26;
     private const int RainDropCount = 7;
+    private const int MoteCount = 26;
+    private const int RayCount = 4;
+    private const int MaxPellets = 8;
+    private const float PelletLifetime = 9f;
+    private const float PelletSinkSpeed = 0.075f;
+    private const float PelletRadiusWorld = 0.045f;
+    private const float PelletEatRadius = 0.055f;
+    private const float PelletChaseRadius = 0.40f;
+    private const float FleeRadius = 0.18f;
+    private const float FleeDuration = 0.9f;
+    private const float EmperorFullCooldown = 7f;
+    private const float SimpleFishFullCooldown = 5f;
+    private const float PauseButtonSize = 52f;
     private const float SimulationSpeed = 42f;
     private const int FishLayer = 8;
     private const float FishCameraSize = 1.55f;
@@ -14,6 +28,26 @@ public sealed class HelloAndroid : MonoBehaviour
     private const float FishCruiseSpeed = 0.07f;
     private const float EmperorLengthFraction = 0.44f;
     private const float EmperorHeightFraction = 0.40f;
+    private const float FishCameraFov = 17.6f;
+    private const float FishCameraDistance = 10f; // camera sits at z = -FishCameraDistance, looking toward +z
+    private const float FishTurnYawSpeed = 165f;
+    private const float FishBankStrength = 0.32f;
+    private const float FishBankMax = 30f;
+    private const float EmperorDepthFar = -3.2f;
+    private const float EmperorDepthNear = 4.2f;
+    private const float SimpleFishTurnMargin = 0.12f;
+    private const int FishSeparationIterations = 8;
+    private const float FishSeparationPadding = 0.012f;
+    private static readonly string[] SimpleFishResources = { "fish01", "fish02", "fish03" };
+    private static readonly Quaternion[] SimpleFishBaseRotations =
+    {
+        Quaternion.Euler(0f, -90f, 0f),
+        Quaternion.Euler(0f, -90f, 0f),
+        Quaternion.Euler(0f, -90f, 0f)
+    };
+    private static readonly float[] SimpleFishLengthFractions = { 0.30f, 0.34f, 0.26f };
+    private static readonly float[] SimpleFishBaseYs = { 0.22f, 0.50f, 0.78f };
+    private static readonly float[] SimpleFishSpeedFactors = { 1.15f, 0.85f, 1.3f };
     private static readonly string[] HeadMarkerTokens = { "Head", "Eye" };
     private static readonly string[] TailMarkerTokens = { "TailFin" };
     private static readonly string[] DorsalMarkerTokens = { "FinDorsal" };
@@ -37,6 +71,14 @@ public sealed class HelloAndroid : MonoBehaviour
         public float phase;
     }
 
+    private struct Mote
+    {
+        public Vector2 position;
+        public float phase;
+        public float size;
+        public float drift;
+    }
+
     private struct Fish
     {
         public Vector2 position;
@@ -45,11 +87,60 @@ public sealed class HelloAndroid : MonoBehaviour
         public float size;
         public float phase;
         public float direction;
+        public float targetDirection;
+        public float depth;
+        public float targetDepth;
+        public float nextDepthTime;
+        public float nextTurnTime;
+        public float glideTime;
+        public float nextGlideTime;
+        public float yaw;
+    }
+
+    private sealed class SimpleFish
+    {
+        public GameObject root;
+        public GameObject pivot;
+        public GameObject model;
+        public MeshRenderer meshRenderer;
+        public Vector3 localForward;
+        public Vector3 localUp;
+        public Vector2 position;
+        public float baseY;
+        public float speedFactor;
+        public float phase;
+        public float direction;
+        public float targetDirection;
+        public float depth;
+        public float targetDepth;
+        public float nextDepthTime;
+        public float nextTurnTime;
+        public float glideTime;
+        public float nextGlideTime;
+        public float yaw;
+        public float fitScale;
+        public float worldHalfLength;
+        public float worldHalfHeight;
+        public FoodPellet targetPellet;
+        public float fedCooldown;
+        public float fleeTime;
+        public Vector2 fleeFrom;
+        public Vector2 schoolOffset;
+        public float depthOffset;
+    }
+
+    private sealed class FoodPellet
+    {
+        public GameObject body;
+        public Vector2 position;
+        public float age;
+        public bool alive;
     }
 
     private Texture2D waterTexture;
     private Texture2D glowTexture;
     private RenderTexture fishRenderTexture;
+    private RenderTexture fishRenderTextureBack;
     private Camera fishCamera;
     private GameObject fishRoot;
     private GameObject fishPivot;
@@ -64,11 +155,23 @@ public sealed class HelloAndroid : MonoBehaviour
     private float fishCalibrateTimer;
     private bool fishCalibrated;
     private Light fishLight;
+    private readonly List<SimpleFish> simpleFish = new List<SimpleFish>();
+    private GameObject simpleFishParent;
     private Color[] waterPixels;
     private float[] heights;
     private float[] velocities;
     private Bubble[] bubbles;
     private RainDrop[] rainDrops;
+    private Mote[] motes;
+    private readonly List<FoodPellet> foodPellets = new List<FoodPellet>();
+    private GameObject pelletsParent;
+    private FoodPellet emperorTarget;
+    private float emperorFedCooldown;
+    private float emperorFleeTime;
+    private Vector2 emperorFleeFrom;
+    private bool appPaused;
+    private float eatFlashTime;
+    private Vector2 eatFlashPosition;
     private Fish fish;
     private Vector2Int fishRenderSize;
     private AudioSource audioSource;
@@ -107,20 +210,44 @@ public sealed class HelloAndroid : MonoBehaviour
             InitializeSimulation();
         }
 
+        HandlePauseInput();
+
+        if (appPaused)
+        {
+            return;
+        }
+
         var deltaTime = Mathf.Min(Time.deltaTime, 0.033f);
         elapsed += deltaTime;
         rippleFlash = Mathf.MoveTowards(rippleFlash, 0f, deltaTime * 2.4f);
+        eatFlashTime = Mathf.MoveTowards(eatFlashTime, 0f, deltaTime * 1.6f);
 
         var tilt = new Vector2(Input.acceleration.x, -Input.acceleration.y);
         smoothedTilt = Vector2.Lerp(smoothedTilt, tilt, 1f - Mathf.Exp(-4.5f * deltaTime));
         SimulateWater(deltaTime);
         UpdateRain(deltaTime);
         UpdateBubbles(deltaTime);
+        UpdateMotes(deltaTime);
+        UpdateFoodPellets(deltaTime);
         UpdateFish(deltaTime);
         EnsureFishScene();
         UpdateFishModel();
+        UpdateSimpleFishMotion(deltaTime);
+        ApplyEmperorSeparation();
+        UpdateSimpleFishModel();
         HandleTouchRipples();
         RenderWaterTexture();
+    }
+
+    private void LateUpdate()
+    {
+        if (!initialized || appPaused)
+        {
+            return;
+        }
+
+        // Render after Animator and all fish transforms have been updated. The camera
+        // stays disabled so it cannot write the shared texture while OnGUI samples it.
         RenderFish();
     }
 
@@ -160,6 +287,19 @@ public sealed class HelloAndroid : MonoBehaviour
             rainDrops[i] = CreateRainDrop(i, true);
         }
 
+        motes = new Mote[MoteCount];
+        for (var i = 0; i < MoteCount; i++)
+        {
+            motes[i] = new Mote
+            {
+                position = new Vector2(UnityEngine.Random.Range(0.03f, 0.97f),
+                    UnityEngine.Random.Range(0f, 1f)),
+                phase = UnityEngine.Random.Range(0f, Mathf.PI * 2f),
+                size = UnityEngine.Random.Range(5f, 16f),
+                drift = UnityEngine.Random.Range(0.003f, 0.013f)
+            };
+        }
+
         fish = new Fish
         {
             position = new Vector2(0.18f, 0.43f),
@@ -167,7 +307,14 @@ public sealed class HelloAndroid : MonoBehaviour
             speed = 0.075f,
             size = 0.22f,
             phase = 0.8f,
-            direction = 1f
+            direction = 1f,
+            targetDirection = 1f,
+            depth = 0.55f,
+            targetDepth = UnityEngine.Random.Range(0.3f, 0.85f),
+            nextDepthTime = UnityEngine.Random.Range(4f, 8f),
+            nextTurnTime = UnityEngine.Random.Range(3f, 7f),
+            nextGlideTime = UnityEngine.Random.Range(5f, 9f),
+            yaw = 0f
         };
 
         // A gentle opening ripple makes the simulation visibly alive immediately.
@@ -272,6 +419,30 @@ public sealed class HelloAndroid : MonoBehaviour
         };
     }
 
+    private void UpdateMotes(float deltaTime)
+    {
+        if (motes == null)
+        {
+            return;
+        }
+
+        for (var i = 0; i < motes.Length; i++)
+        {
+            var mote = motes[i];
+            mote.position.y -= mote.drift * deltaTime;
+            mote.position.x += Mathf.Sin(elapsed * 0.3f + mote.phase) * deltaTime * 0.0022f;
+
+            if (mote.position.y < -0.04f)
+            {
+                mote.position = new Vector2(UnityEngine.Random.Range(0.03f, 0.97f), 1.04f);
+                mote.size = UnityEngine.Random.Range(5f, 16f);
+            }
+
+            mote.position.x = Mathf.Clamp(mote.position.x, 0.01f, 0.99f);
+            motes[i] = mote;
+        }
+    }
+
     private void UpdateBubbles(float deltaTime)
     {
         for (var i = 0; i < bubbles.Length; i++)
@@ -293,23 +464,396 @@ public sealed class HelloAndroid : MonoBehaviour
         }
     }
 
+    private void HandleTapAction(Vector2 normalized)
+    {
+        // One tap both drops a food pellet and startles nearby fish.
+        SpawnFoodPellet(normalized);
+        TriggerTapReaction(normalized);
+    }
+
+    private void EnsurePelletsParent()
+    {
+        if (pelletsParent != null)
+        {
+            return;
+        }
+
+        pelletsParent = new GameObject("AquaFlow_FoodPellets");
+        pelletsParent.transform.position = Vector3.zero;
+        pelletsParent.transform.localScale = Vector3.one;
+    }
+
+    private static Mesh pelletMesh;
+
+    private void SpawnFoodPellet(Vector2 position)
+    {
+        if (foodPellets.Count >= MaxPellets)
+        {
+            return;
+        }
+
+        EnsurePelletsParent();
+        var pellet = new FoodPellet
+        {
+            position = position,
+            alive = true
+        };
+
+        // Built-in primitives need the SphereCollider class, which IL2CPP strips on
+        // Android, so the pellet sphere is built by hand instead.
+        if (pelletMesh == null)
+        {
+            pelletMesh = BuildSphereMesh(PelletRadiusWorld, 10, 12);
+        }
+
+        var body = new GameObject("AquaFlow_Food");
+        body.layer = FishLayer;
+        body.transform.SetParent(pelletsParent.transform, false);
+        body.transform.localScale = Vector3.one;
+        body.AddComponent<MeshFilter>().sharedMesh = pelletMesh;
+
+        var renderer = body.AddComponent<MeshRenderer>();
+        var material = new Material(Shader.Find("Standard"));
+        material.color = new Color(1f, 0.62f, 0.28f);
+        material.EnableKeyword("_EMISSION");
+        material.SetColor("_EmissionColor", new Color(1f, 0.55f, 0.2f));
+        renderer.sharedMaterial = material;
+        pellet.body = body;
+
+        PositionPelletBody(pellet);
+        foodPellets.Add(pellet);
+    }
+
+    private static Mesh BuildSphereMesh(float radius, int rings, int segments)
+    {
+        var mesh = new Mesh();
+        var vertices = new List<Vector3>();
+        var normals = new List<Vector3>();
+        var triangles = new List<int>();
+
+        for (var lat = 0; lat <= rings; lat++)
+        {
+            var theta = Mathf.PI * lat / rings;
+            var sinTheta = Mathf.Sin(theta);
+            var cosTheta = Mathf.Cos(theta);
+            for (var lon = 0; lon <= segments; lon++)
+            {
+                var phi = 2f * Mathf.PI * lon / segments;
+                var vertex = new Vector3(sinTheta * Mathf.Cos(phi), cosTheta, sinTheta * Mathf.Sin(phi)) * radius;
+                vertices.Add(vertex);
+                normals.Add(vertex.normalized);
+            }
+        }
+
+        for (var lat = 0; lat < rings; lat++)
+        {
+            for (var lon = 0; lon < segments; lon++)
+            {
+                var a = lat * (segments + 1) + lon;
+                var b = a + segments + 1;
+                triangles.Add(a);
+                triangles.Add(b);
+                triangles.Add(a + 1);
+                triangles.Add(a + 1);
+                triangles.Add(b);
+                triangles.Add(b + 1);
+            }
+        }
+
+        mesh.vertices = vertices.ToArray();
+        mesh.normals = normals.ToArray();
+        mesh.triangles = triangles.ToArray();
+        mesh.RecalculateBounds();
+        return mesh;
+    }
+
+    private void PositionPelletBody(FoodPellet pellet)
+    {
+        if (pellet.body == null)
+        {
+            return;
+        }
+
+        pellet.body.transform.position = FishSpaceToWorld(pellet.position, 0.32f);
+    }
+
+    private float FishViewScale(float depth)
+    {
+        // The fish camera is perspective, so the visible area grows with distance
+        // from the camera (reference plane z = 0 sits exactly FishCameraDistance away).
+        var z = Mathf.Lerp(EmperorDepthFar, EmperorDepthNear, depth);
+        return (z + FishCameraDistance) / FishCameraDistance;
+    }
+
+    private Vector3 FishSpaceToWorld(Vector2 fishPosition, float depth)
+    {
+        if (fishRenderSize.x <= 0)
+        {
+            return Vector3.zero;
+        }
+
+        var scale = FishViewScale(depth);
+        var aspect = (float)fishRenderSize.x / Mathf.Max(1, fishRenderSize.y);
+        var worldWidth = FishCameraSize * 2f * aspect * scale;
+        var worldHeight = FishCameraSize * 2f * scale;
+        var z = Mathf.Lerp(EmperorDepthFar, EmperorDepthNear, depth);
+        return new Vector3(
+            (fishPosition.x - 0.5f) * worldWidth,
+            (0.5f - fishPosition.y) * worldHeight,
+            z);
+    }
+
+    // Places a fish so that its body always stays inside the perspective frustum at
+    // its current depth. Because the visible area shrinks when the fish swims far
+    // away, the normalized position alone is not enough: without this inset clamp a
+    // far fish near the left/right edge would be sliced by the frustum border.
+    private void PlaceFishAt(Transform target, Vector2 fishPosition, float depth,
+        float halfLengthWorld, ref float direction, ref float targetDirection, bool bounceAtWall)
+    {
+        if (fishRenderSize.x <= 0 || target == null)
+        {
+            return;
+        }
+
+        var scale = FishViewScale(depth);
+        var aspect = (float)fishRenderSize.x / Mathf.Max(1, fishRenderSize.y);
+        var worldWidth = FishCameraSize * 2f * aspect * scale;
+        var worldHeight = FishCameraSize * 2f * scale;
+        var rawX = (fishPosition.x - 0.5f) * worldWidth;
+        var rawY = (0.5f - fishPosition.y) * worldHeight;
+
+        var halfHeightWorld = halfLengthWorld * 0.42f;
+        // Small hairline pad beyond the body half-extent so fish never even touch the border.
+        var maxX = Mathf.Max(0f, worldWidth * 0.5f - halfLengthWorld - worldWidth * 0.02f);
+        var maxY = Mathf.Max(0f, worldHeight * 0.5f - halfHeightWorld - worldHeight * 0.02f);
+        var x = Mathf.Clamp(rawX, -maxX, maxX);
+        var y = Mathf.Clamp(rawY, -maxY, maxY);
+
+        // Soft wall: if the body pressed the edge while free-swimming, turn around
+        // instead of hovering. While chasing food or fleeing a tap the fish may keep
+        // pressing the wall, so it must not bounce back and forth every frame.
+        if (bounceAtWall && Mathf.Abs(rawX - x) > 0.0001f &&
+            ((direction > 0f && rawX > 0f) || (direction < 0f && rawX < 0f)))
+        {
+            targetDirection = -direction;
+            direction = targetDirection;
+        }
+
+        var z = Mathf.Lerp(EmperorDepthFar, EmperorDepthNear, depth);
+        target.position = new Vector3(x, y, z);
+    }
+
+    private void UpdateFoodPellets(float deltaTime)
+    {
+        for (var i = foodPellets.Count - 1; i >= 0; i--)
+        {
+            var pellet = foodPellets[i];
+            if (!pellet.alive)
+            {
+                if (pellet.body != null)
+                {
+                    Destroy(pellet.body);
+                }
+                foodPellets.RemoveAt(i);
+                continue;
+            }
+
+            pellet.age += deltaTime;
+            // Gentle sway while it sinks slowly toward the floor.
+            pellet.position.x = Mathf.Clamp(
+                pellet.position.x + Mathf.Sin(elapsed * 1.9f + pellet.age * 3f) * deltaTime * 0.004f,
+                0.02f, 0.98f);
+            if (pellet.position.y < 0.94f)
+            {
+                pellet.position.y = Mathf.Min(pellet.position.y + PelletSinkSpeed * deltaTime, 0.94f);
+            }
+
+            if (pellet.age > PelletLifetime)
+            {
+                pellet.alive = false;
+            }
+            else
+            {
+                PositionPelletBody(pellet);
+            }
+        }
+    }
+
+    private FoodPellet FindNearestPellet(Vector2 from, float radius)
+    {
+        FoodPellet best = null;
+        var bestDistance = radius;
+        for (var i = 0; i < foodPellets.Count; i++)
+        {
+            var pellet = foodPellets[i];
+            if (!pellet.alive)
+            {
+                continue;
+            }
+
+            var distance = Vector2.Distance(from, pellet.position);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                best = pellet;
+            }
+        }
+
+        return best;
+    }
+
+    private void EatPellet(FoodPellet pellet)
+    {
+        pellet.alive = false;
+        if (pellet.body != null)
+        {
+            Destroy(pellet.body);
+        }
+        eatFlashTime = 0.45f;
+        eatFlashPosition = pellet.position;
+    }
+
+    private void TriggerTapReaction(Vector2 tap)
+    {
+        if (Vector2.Distance(fish.position, tap) < FleeRadius && emperorFleeTime <= 0f)
+        {
+            emperorFleeTime = FleeDuration;
+            emperorFleeFrom = tap;
+            emperorTarget = null;
+        }
+
+        for (var i = 0; i < simpleFish.Count; i++)
+        {
+            var fish = simpleFish[i];
+            if (fish.fleeTime <= 0f && Vector2.Distance(fish.position, tap) < FleeRadius)
+            {
+                fish.fleeTime = FleeDuration;
+                fish.fleeFrom = tap;
+                fish.targetPellet = null;
+            }
+        }
+    }
+
+    private static Vector2 ClampFishPosition(Vector2 position)
+    {
+        position.x = Mathf.Clamp(position.x, 0.04f, 0.96f);
+        position.y = Mathf.Clamp(position.y, 0.04f, 0.96f);
+        return position;
+    }
+
     private void UpdateFish(float deltaTime)
     {
         var currentFlow = smoothedTilt.x * 0.018f;
         var cruise = FishCruiseSpeed * (0.72f + 0.4f * (0.5f + 0.5f * Mathf.Sin(elapsed * 0.62f + fish.phase * 1.7f)));
-        fish.position.x += (cruise + currentFlow) * fish.direction * deltaTime;
-        fish.position.y = fish.baseY + Mathf.Sin(elapsed * 0.9f + fish.phase) * 0.035f;
 
-        // Turn around near the screen edges instead of teleporting across.
+        // Occasional mid-water heading change and glides, like a fish cruising.
+        fish.nextTurnTime -= deltaTime;
+        if (fish.nextTurnTime <= 0f)
+        {
+            fish.nextTurnTime = UnityEngine.Random.Range(3.4f, 7.6f);
+            if (UnityEngine.Random.value < 0.5f)
+            {
+                fish.targetDirection = -fish.targetDirection;
+            }
+        }
+
+        fish.nextGlideTime -= deltaTime;
+        if (fish.nextGlideTime <= 0f)
+        {
+            fish.nextGlideTime = UnityEngine.Random.Range(6f, 12f);
+            fish.glideTime = UnityEngine.Random.Range(0.8f, 1.6f);
+        }
+
+        if (fish.glideTime > 0f)
+        {
+            fish.glideTime -= deltaTime;
+            cruise *= 0.28f;
+        }
+
+        // Always turn around before leaving the visible water.
         const float turnMargin = 0.10f;
-        if (fish.direction > 0f && fish.position.x >= 1f - turnMargin)
+        if (fish.targetDirection > 0f && fish.position.x >= 1f - turnMargin)
         {
-            fish.direction = -1f;
+            fish.targetDirection = -1f;
         }
-        else if (fish.direction < 0f && fish.position.x <= turnMargin)
+        else if (fish.targetDirection < 0f && fish.position.x <= turnMargin)
         {
-            fish.direction = 1f;
+            fish.targetDirection = 1f;
         }
+
+        fish.direction = fish.targetDirection;
+
+        if (emperorFedCooldown > 0f)
+        {
+            emperorFedCooldown -= deltaTime;
+        }
+
+        // Flee: dart away from a recent nearby tap.
+        if (emperorFleeTime > 0f)
+        {
+            emperorFleeTime -= deltaTime;
+            emperorTarget = null;
+            var away = fish.position - emperorFleeFrom;
+            if (away.sqrMagnitude < 0.0004f)
+            {
+                away = new Vector2(fish.direction > 0f ? 1f : -1f, 0f);
+            }
+            away.Normalize();
+            var fleeSpeed = cruise * 3.4f;
+            fish.position += away * fleeSpeed * deltaTime;
+            fish.position.x = Mathf.Clamp(fish.position.x, 0.05f, 0.95f);
+            fish.position.y = Mathf.Clamp(fish.position.y, 0.05f, 0.95f);
+            fish.direction = away.x >= 0f ? 1f : -1f;
+            return;
+        }
+
+        // Feed: chase the nearest pellet when hungry.
+        if (emperorFedCooldown <= 0f && (emperorTarget == null || !emperorTarget.alive))
+        {
+            emperorTarget = FindNearestPellet(fish.position, PelletChaseRadius);
+        }
+
+        if (emperorTarget != null)
+        {
+            var pelletPosition = emperorTarget.position;
+            var deltaX = pelletPosition.x - fish.position.x;
+            var deltaY = pelletPosition.y - fish.position.y;
+            fish.direction = deltaX >= 0f ? 1f : -1f;
+            var chaseSpeed = Mathf.Max(cruise * 2.5f, 0.085f);
+            fish.position.x = Mathf.MoveTowards(fish.position.x, pelletPosition.x, chaseSpeed * deltaTime);
+            fish.position.y = Mathf.MoveTowards(fish.position.y, pelletPosition.y, chaseSpeed * 0.92f * deltaTime);
+            fish.position.x = Mathf.Clamp(fish.position.x, 0.05f, 0.95f);
+            fish.position.y = Mathf.Clamp(fish.position.y, 0.05f, 0.95f);
+
+            if (Mathf.Abs(deltaX) < PelletEatRadius && Mathf.Abs(deltaY) < PelletEatRadius)
+            {
+                emperorFedCooldown = EmperorFullCooldown;
+                EatPellet(emperorTarget);
+                emperorTarget = null;
+            }
+            return;
+        }
+
+        // Depth excursions: swim farther from / closer to the camera.
+        fish.nextDepthTime -= deltaTime;
+        if (fish.nextDepthTime <= 0f)
+        {
+            fish.nextDepthTime = UnityEngine.Random.Range(5f, 10f);
+            fish.targetDepth = UnityEngine.Random.Range(0.12f, 0.95f);
+        }
+
+        fish.depth = Mathf.Lerp(fish.depth, fish.targetDepth, 1f - Mathf.Exp(-0.45f * deltaTime));
+
+        // Vertical: gentle bob around a slowly drifting band.
+        var targetY = fish.baseY + Mathf.Sin(elapsed * 0.9f + fish.phase) * 0.035f;
+        fish.position.y = Mathf.Lerp(fish.position.y, targetY, 1f - Mathf.Exp(-2.4f * deltaTime));
+
+        // Horizontal speed follows the visual heading, so the fish slows while turning.
+        var yawRadians = fish.yaw * Mathf.Deg2Rad;
+        var headingX = Mathf.Cos(yawRadians);
+        var turnSlow = 0.35f + 0.65f * Mathf.Abs(headingX);
+        fish.position.x += (cruise + currentFlow) * turnSlow * Mathf.Sign(headingX) * deltaTime;
+        fish.position.x = Mathf.Clamp(fish.position.x, turnMargin, 1f - turnMargin);
     }
 
     private void HandleTouchRipples()
@@ -322,13 +866,30 @@ public sealed class HelloAndroid : MonoBehaviour
                 continue;
             }
 
+            // A tap on the pause button only toggles pause - no ripple or food.
+            if (touch.phase == TouchPhase.Began &&
+                PauseButtonRect().Contains(new Vector2(touch.position.x, Screen.height - touch.position.y)))
+            {
+                continue;
+            }
+
             var normalized = ScreenToNormalized(touch.position);
             AddRipple(normalized.x, normalized.y, touch.phase == TouchPhase.Began ? 0.58f : 0.20f);
             lastTouchPosition = touch.position;
             rippleFlash = 1f;
+
+            if (touch.phase == TouchPhase.Began)
+            {
+                HandleTapAction(normalized);
+            }
         }
 
 #if UNITY_EDITOR
+        if (Input.GetMouseButtonDown(0))
+        {
+            HandleTapAction(ScreenToNormalized(Input.mousePosition));
+        }
+
         if (Input.GetMouseButton(0))
         {
             if (Vector2.Distance(lastTouchPosition, Input.mousePosition) > 18f)
@@ -369,8 +930,8 @@ public sealed class HelloAndroid : MonoBehaviour
                     continue;
                 }
 
-                var cellX = centerX + x;
-                var cellY = centerY + y;
+                var cellX = Mathf.Clamp(centerX + x, 0, WaterWidth - 1);
+                var cellY = Mathf.Clamp(centerY + y, 0, WaterHeight - 1);
                 var index = cellY * WaterWidth + cellX;
                 var falloff = 1f - distance / radius;
                 heights[index] += strength * falloff * falloff;
@@ -418,6 +979,15 @@ public sealed class HelloAndroid : MonoBehaviour
                 color += new Color(0.02f, 0.42f, 0.48f) * Mathf.Max(0f, caustic) * 0.18f;
                 color += Color.white * (movingHighlight * 0.18f + Mathf.Max(0f, -slopeX - slopeY) * 0.07f);
 
+                // Darker toward the floor with a faint caustic shimmer near the bottom.
+                var floorShade = 1f - Mathf.Clamp01((normalizedY - 0.68f) / 0.32f) * 0.38f;
+                color *= floorShade;
+                var floorCaustic = normalizedY > 0.72f
+                    ? (0.5f + 0.5f * Mathf.Sin(x * 0.35f + elapsed * 0.9f)) *
+                      (0.5f + 0.5f * Mathf.Sin(y * 0.11f - elapsed * 0.55f)) * 0.06f
+                    : 0f;
+                color += new Color(0.01f, 0.14f, 0.13f) * floorCaustic;
+
                 var edge = Mathf.Min(Mathf.Min(x, WaterWidth - 1 - x), Mathf.Min(y, WaterHeight - 1 - y));
                 var edgeShade = Mathf.Clamp01(edge / 7f);
                 color *= 0.72f + edgeShade * 0.28f;
@@ -440,11 +1010,21 @@ public sealed class HelloAndroid : MonoBehaviour
         GUI.color = Color.white;
         GUI.DrawTexture(new Rect(0f, 0f, Screen.width, Screen.height), waterTexture,
             ScaleMode.StretchToFill, false);
+        DrawFishShadows();
         DrawFishRenderTexture();
+        DrawPellets();
+        DrawEatFlash();
         DrawRain();
         DrawBubbles();
+        DrawMotes();
+        DrawRays();
+        if (appPaused)
+        {
+            DrawPausedOverlay();
+        }
         DrawHeader();
         DrawFooter();
+        DrawPauseButton();
     }
 
     private void DrawFishRenderTexture()
@@ -499,6 +1079,218 @@ public sealed class HelloAndroid : MonoBehaviour
         }
 
         GUI.color = Color.white;
+    }
+
+    private void DrawFishShadows()
+    {
+        // Soft fake shadows keep the fish visually grounded; they are drawn before
+        // the fish texture so each fish body overlaps its own shadow.
+        if (appPaused || fishRenderSize.x <= 0)
+        {
+            return;
+        }
+
+        DrawFishShadow(fish.position, fish.depth, EmperorLengthFraction);
+        for (var i = 0; i < simpleFish.Count; i++)
+        {
+            DrawFishShadow(simpleFish[i].position, simpleFish[i].depth, SimpleFishLengthFractions[i]);
+        }
+    }
+
+    private void DrawFishShadow(Vector2 fishPosition, float depth, float lengthFraction)
+    {
+        var depthScale = 0.75f + 0.5f * depth;
+        var sizeFactor = lengthFraction / EmperorLengthFraction;
+        var width = Screen.height * 0.10f * sizeFactor * depthScale;
+        var height = width * 0.42f;
+        var x = fishPosition.x * Screen.width;
+        var y = fishPosition.y * Screen.height + height * 0.7f;
+        GUI.color = new Color(0.005f, 0.015f, 0.04f, 0.15f * depthScale);
+        GUI.DrawTexture(new Rect(x - width * 0.5f, y - height * 0.5f, width, height),
+            glowTexture, ScaleMode.StretchToFill, true);
+        GUI.color = Color.white;
+    }
+
+    private void DrawPellets()
+    {
+        for (var i = 0; i < foodPellets.Count; i++)
+        {
+            var pellet = foodPellets[i];
+            if (!pellet.alive)
+            {
+                continue;
+            }
+
+            var x = pellet.position.x * Screen.width;
+            var y = pellet.position.y * Screen.height;
+            var pulse = 0.8f + 0.2f * Mathf.Sin(elapsed * 7f + pellet.age * 5f);
+            var size = Screen.height * 0.02f * pulse;
+            GUI.color = new Color(1f, 0.72f, 0.35f, 0.95f);
+            GUI.DrawTexture(new Rect(x - size * 0.5f, y - size * 0.5f, size, size),
+                glowTexture, ScaleMode.StretchToFill, true);
+        }
+
+        GUI.color = Color.white;
+    }
+
+    private void DrawEatFlash()
+    {
+        if (eatFlashTime <= 0f)
+        {
+            return;
+        }
+
+        var size = Screen.height * 0.09f * (1f - eatFlashTime * 0.4f);
+        var x = eatFlashPosition.x * Screen.width;
+        var y = eatFlashPosition.y * Screen.height;
+        GUI.color = new Color(1f, 0.75f, 0.4f, Mathf.Clamp01(eatFlashTime * 1.4f));
+        GUI.DrawTexture(new Rect(x - size * 0.5f, y - size * 0.5f, size, size),
+            glowTexture, ScaleMode.StretchToFill, true);
+        GUI.color = Color.white;
+    }
+
+    private void DrawMotes()
+    {
+        if (motes == null || appPaused)
+        {
+            return;
+        }
+
+        for (var i = 0; i < motes.Length; i++)
+        {
+            var mote = motes[i];
+            var pulse = 0.5f + 0.5f * Mathf.Sin(elapsed * 0.7f + mote.phase * 2f);
+            var size = mote.size * (0.85f + 0.35f * pulse);
+            var x = mote.position.x * Screen.width;
+            var y = mote.position.y * Screen.height;
+            GUI.color = new Color(0.6f, 0.95f, 1f, 0.05f + pulse * 0.09f);
+            GUI.DrawTexture(new Rect(x - size * 0.5f, y - size * 0.5f, size, size),
+                glowTexture, ScaleMode.StretchToFill, true);
+        }
+
+        GUI.color = Color.white;
+    }
+
+    private void DrawRays()
+    {
+        if (appPaused)
+        {
+            return;
+        }
+
+        for (var i = 0; i < RayCount; i++)
+        {
+            var sway = Mathf.Sin(elapsed * 0.05f + i * 2.1f) * 0.05f;
+            var x = Screen.width * (0.16f + i * 0.24f + sway);
+            var width = Screen.width * 0.11f;
+            var alpha = 0.035f + 0.02f * (0.5f + 0.5f * Mathf.Sin(elapsed * 0.3f + i * 1.7f));
+            GUI.color = new Color(0.72f, 0.98f, 1f, alpha);
+            GUI.DrawTexture(new Rect(x - width * 0.5f, -Screen.height * 0.08f, width, Screen.height * 0.58f),
+                glowTexture, ScaleMode.StretchToFill, true);
+        }
+
+        GUI.color = Color.white;
+    }
+
+    private void HandlePauseInput()
+    {
+        var pauseRect = PauseButtonRect();
+        for (var i = 0; i < Input.touchCount; i++)
+        {
+            var touch = Input.GetTouch(i);
+            if (touch.phase != TouchPhase.Began)
+            {
+                continue;
+            }
+
+            var guiPosition = new Vector2(touch.position.x, Screen.height - touch.position.y);
+            if (pauseRect.Contains(guiPosition))
+            {
+                SetPaused(!appPaused);
+                return;
+            }
+
+            if (appPaused)
+            {
+                var buttonWidth = Screen.width * 0.46f;
+                var buttonHeight = Screen.height * 0.085f;
+                var resumeRect = new Rect((Screen.width - buttonWidth) * 0.5f, Screen.height * 0.44f,
+                    buttonWidth, buttonHeight);
+                if (resumeRect.Contains(guiPosition))
+                {
+                    SetPaused(false);
+                    return;
+                }
+            }
+        }
+    }
+
+    private Rect PauseButtonRect()
+    {
+        var margin = Screen.width * 0.055f;
+        return new Rect(Screen.width - margin - PauseButtonSize, margin, PauseButtonSize, PauseButtonSize);
+    }
+
+    private void DrawPauseButton()
+    {
+        var rect = PauseButtonRect();
+
+        // Two soft bars as the pause glyph.
+        var barWidth = 8f;
+        var barHeight = 24f;
+        var centerX = rect.x + rect.width * 0.5f;
+        var top = rect.y + (rect.height - barHeight) * 0.5f;
+        GUI.color = new Color(0.85f, 1f, 1f, 0.95f);
+        GUI.DrawTexture(new Rect(centerX - barWidth - 4f, top, barWidth, barHeight),
+            glowTexture, ScaleMode.StretchToFill, true);
+        GUI.DrawTexture(new Rect(centerX + 4f, top, barWidth, barHeight),
+            glowTexture, ScaleMode.StretchToFill, true);
+        GUI.color = Color.white;
+    }
+
+    private void DrawPausedOverlay()
+    {
+        GUI.color = new Color(0f, 0.01f, 0.03f, 0.55f);
+        GUI.DrawTexture(new Rect(0f, 0f, Screen.width, Screen.height), glowTexture,
+            ScaleMode.StretchToFill, true);
+        GUI.color = Color.white;
+
+        var buttonWidth = Screen.width * 0.46f;
+        var buttonHeight = Screen.height * 0.085f;
+        var button = new Rect((Screen.width - buttonWidth) * 0.5f, Screen.height * 0.44f,
+            buttonWidth, buttonHeight);
+
+        GUI.Label(new Rect(button.x, button.y - buttonHeight * 1.15f, buttonWidth, buttonHeight * 1.1f),
+            "PAUSED", titleStyle);
+        GUI.Label(new Rect(button.x, button.y + buttonHeight * 1.05f, buttonWidth, buttonHeight * 0.8f),
+            "TAP TO RESUME", subtitleStyle);
+    }
+
+    private void SetPaused(bool paused)
+    {
+        if (appPaused == paused)
+        {
+            return;
+        }
+
+        appPaused = paused;
+        if (paused)
+        {
+            Debug.Log("PAUSE: simulation paused.");
+        }
+        else
+        {
+            Debug.Log("PAUSE: simulation resumed.");
+            OnResumeFromPause();
+        }
+    }
+
+    private void OnResumeFromPause()
+    {
+        // Natural interstitial-ad moment: the user has finished an idle break and
+        // is returning to the aquarium. To plug AdMob here, load an interstitial
+        // in SetPaused(true) and call Show() from this method once ready.
+        Debug.Log("ADSPOT: interstitial trigger reached (pause -> resume).");
     }
 
     private void DrawHeader()
@@ -634,12 +1426,14 @@ public sealed class HelloAndroid : MonoBehaviour
         fishCamera = new GameObject("AquaFlow_3D_FishCamera").AddComponent<Camera>();
         fishCamera.clearFlags = CameraClearFlags.SolidColor;
         fishCamera.backgroundColor = new Color(0f, 0f, 0f, 0f);
-        fishCamera.orthographic = true;
-        fishCamera.orthographicSize = FishCameraSize;
+        fishCamera.orthographic = false;
+        fishCamera.fieldOfView = FishCameraFov;
         fishCamera.nearClipPlane = 0.1f;
-        fishCamera.farClipPlane = 20f;
+        fishCamera.farClipPlane = 30f;
         fishCamera.cullingMask = 1 << FishLayer;
-        fishCamera.allowHDR = true;
+        fishCamera.allowHDR = false;
+        fishCamera.allowMSAA = false;
+        fishCamera.useOcclusionCulling = false;
         fishCamera.transform.position = new Vector3(0f, 0f, -10f);
         fishCamera.transform.rotation = Quaternion.identity;
         fishLight = fishRoot.AddComponent<Light>();
@@ -653,17 +1447,28 @@ public sealed class HelloAndroid : MonoBehaviour
         fishCamera.transform.rotation = Quaternion.identity;
         fishCamera.enabled = false;
         fishRenderSize = new Vector2Int(256, 440);
-        fishRenderTexture = new RenderTexture(fishRenderSize.x, fishRenderSize.y, 16,
+        fishRenderTexture = CreateFishRenderTexture();
+        fishRenderTextureBack = CreateFishRenderTexture();
+        fishCamera.targetTexture = fishRenderTextureBack;
+        // Manual LateUpdate rendering keeps the front texture stable while OnGUI
+        // composites it. The camera always renders into the separate back buffer.
+        fishCamera.enabled = false;
+        EnsureSimpleFish();
+    }
+
+    private RenderTexture CreateFishRenderTexture()
+    {
+        var texture = new RenderTexture(fishRenderSize.x, fishRenderSize.y, 24,
             RenderTextureFormat.ARGB32)
         {
             filterMode = FilterMode.Bilinear,
             wrapMode = TextureWrapMode.Clamp,
-            antiAliasing = 2,
+            antiAliasing = 1,
             useMipMap = false,
             autoGenerateMips = false
         };
-        fishCamera.targetTexture = fishRenderTexture;
-        fishCamera.enabled = false;
+        texture.Create();
+        return texture;
     }
 
     private void SpawnEmperorModel()
@@ -693,6 +1498,13 @@ public sealed class HelloAndroid : MonoBehaviour
             Debug.LogError("Emperor Angelfish prefab has no SkinnedMeshRenderer.");
             return;
         }
+
+        // The fish is rendered by a manually positioned camera. Keep the skinned
+        // bounds live even while the model crosses the camera frustum; otherwise
+        // Unity can cull one animation pose and show it again on the next frame.
+        fishRenderer.updateWhenOffscreen = true;
+        fishRenderer.skinnedMotionVectors = false;
+        fishRenderer.motionVectorGenerationMode = MotionVectorGenerationMode.ForceNoMotion;
 
         var head = MarkerCenter(fishModel.transform, HeadMarkerTokens);
         var tail = MarkerCenter(fishModel.transform, TailMarkerTokens);
@@ -871,27 +1683,486 @@ public sealed class HelloAndroid : MonoBehaviour
 
         CalibrateFish();
 
-        var aspect = (float)fishRenderSize.x / Mathf.Max(1, fishRenderSize.y);
-        var worldWidth = FishCameraSize * 2f * aspect;
-        var worldHeight = FishCameraSize * 2f;
-        var x = (fish.position.x - 0.5f) * worldWidth;
-        var y = (0.5f - fish.position.y) * worldHeight;
-        fishRoot.transform.position = new Vector3(x, y, 0f);
-        fishPivot.transform.localRotation = Quaternion.Euler(0f, fish.direction > 0f ? 0f : 180f, 0f);
+        // Depth-aware placement keeps the whole body inside the frustum at any depth.
+        var halfLength = fishLocalLength * fishRoot.transform.localScale.x * 0.5f;
+        var freeSwimming = emperorFleeTime <= 0f && emperorTarget == null;
+        PlaceFishAt(fishRoot.transform, fish.position, fish.depth, halfLength,
+            ref fish.direction, ref fish.targetDirection, freeSwimming);
+
+        // Smooth yaw turn with banking roll into the turn and nose pitch with the bob.
+        var yawTarget = fish.direction > 0f ? 0f : 180f;
+        fish.yaw = Mathf.MoveTowardsAngle(fish.yaw, yawTarget, FishTurnYawSpeed * Time.deltaTime);
+        var turnRate = Mathf.DeltaAngle(fish.yaw, yawTarget);
+        var bank = Mathf.Clamp(turnRate * FishBankStrength, -FishBankMax, FishBankMax);
+        var pitch = Mathf.Clamp(-Mathf.Cos(elapsed * 0.9f + fish.phase) * 6f, -9f, 9f);
+        fishPivot.transform.localRotation =
+            Quaternion.Euler(0f, fish.yaw, 0f) *
+            Quaternion.Euler(0f, 0f, pitch) *
+            Quaternion.Euler(bank, 0f, 0f);
+
         if (fishCalibrated)
         {
             fishRoot.transform.localScale = Vector3.one * fishFitScale;
         }
     }
 
-    private void RenderFish()
+    private void EnsureSimpleFish()
     {
-        if (fishCamera == null || fishRenderTexture == null)
+        if (simpleFish.Count > 0)
         {
             return;
         }
 
+        if (simpleFishParent == null)
+        {
+            // Neutral parent: the emperor's fishRoot carries its own fit scale and
+            // position, so the simple fish must NOT be parented under it.
+            simpleFishParent = new GameObject("AquaFlow_SimpleFish");
+            simpleFishParent.transform.position = Vector3.zero;
+            simpleFishParent.transform.localScale = Vector3.one;
+        }
+
+        for (var i = 0; i < SimpleFishResources.Length; i++)
+        {
+            var prefab = Resources.Load<GameObject>(SimpleFishResources[i]);
+            if (prefab == null)
+            {
+                Debug.LogError("Low Poly fish prefab missing from Resources: " + SimpleFishResources[i]);
+                continue;
+            }
+
+            var fish = new SimpleFish
+            {
+                phase = UnityEngine.Random.Range(0f, Mathf.PI * 2f),
+                baseY = SimpleFishBaseYs[i] + UnityEngine.Random.Range(-0.03f, 0.03f),
+                position = new Vector2(UnityEngine.Random.Range(0.18f, 0.82f), 0.5f),
+                depth = UnityEngine.Random.Range(0.25f, 0.75f),
+                targetDepth = UnityEngine.Random.Range(0.2f, 0.8f),
+                nextDepthTime = UnityEngine.Random.Range(4f, 9f),
+                nextTurnTime = UnityEngine.Random.Range(3f, 8f),
+                nextGlideTime = UnityEngine.Random.Range(5f, 12f),
+                speedFactor = SimpleFishSpeedFactors[i],
+                direction = UnityEngine.Random.value < 0.5f ? 1f : -1f,
+                targetDirection = UnityEngine.Random.value < 0.5f ? 1f : -1f
+            };
+            fish.yaw = fish.direction > 0f ? 0f : 180f;
+            fish.schoolOffset = i == 0 ? Vector2.zero
+                : new Vector2(0.085f, i == 1 ? -0.02f : 0.035f);
+            fish.depthOffset = i == 1 ? -0.06f : 0.07f;
+
+            fish.root = new GameObject("AquaFlow_Fish_" + SimpleFishResources[i]);
+            fish.root.layer = FishLayer;
+            fish.root.transform.SetParent(simpleFishParent.transform, false);
+
+            fish.pivot = new GameObject("Pivot");
+            fish.pivot.layer = FishLayer;
+            fish.pivot.transform.SetParent(fish.root.transform, false);
+
+            fish.model = Instantiate(prefab, fish.pivot.transform, false);
+            fish.model.name = SimpleFishResources[i];
+            SetLayerRecursively(fish.model.transform, FishLayer);
+
+            var filter = fish.model.GetComponentInChildren<MeshFilter>();
+            fish.meshRenderer = fish.model.GetComponentInChildren<MeshRenderer>();
+            if (filter == null || filter.sharedMesh == null || fish.meshRenderer == null)
+            {
+                Debug.LogError("Low Poly fish has no mesh: " + SimpleFishResources[i]);
+                Destroy(fish.root);
+                continue;
+            }
+
+            var mesh = filter.sharedMesh;
+            var baseRotation = SimpleFishBaseRotations[i];
+            fish.localForward = new Vector3(0f, 0f, -1f);
+            fish.localUp = Vector3.up;
+
+            // Center the mesh on the pivot and point its nose (-Z) toward +X.
+            fish.model.transform.localRotation = baseRotation;
+            fish.model.transform.localPosition = -(baseRotation * mesh.bounds.center);
+
+            // Static mesh: measure the nose-tail half extent from the AABB corners.
+            var halfLength = 0f;
+            var halfHeight = 0f;
+            foreach (var corner in MeshBoundsCorners(mesh.bounds))
+            {
+                halfLength = Mathf.Max(halfLength, Mathf.Abs(Vector3.Dot(corner, fish.localForward)));
+                halfHeight = Mathf.Max(halfHeight, Mathf.Abs(Vector3.Dot(corner, fish.localUp)));
+            }
+
+            var aspect = (float)fishRenderSize.x / Mathf.Max(1, fishRenderSize.y);
+            var targetWidth = FishCameraSize * 2f * aspect * SimpleFishLengthFractions[i];
+            fish.fitScale = halfLength > 0.0001f ? targetWidth / (halfLength * 2f) : 1f;
+            fish.root.transform.localScale = Vector3.one * fish.fitScale;
+
+            fish.worldHalfLength = fish.fitScale * halfLength;
+            fish.worldHalfHeight = fish.fitScale * halfHeight;
+            fish.position.y = fish.baseY;
+            simpleFish.Add(fish);
+            Debug.Log("SIMPLEFISH spawned " + SimpleFishResources[i] +
+                " scale=" + fish.fitScale.ToString("F4") +
+                " halfLen=" + halfLength.ToString("F3") +
+                " halfH=" + halfHeight.ToString("F3"));
+        }
+    }
+
+    private static Vector3[] MeshBoundsCorners(Bounds bounds)
+    {
+        var corners = new Vector3[8];
+        var index = 0;
+        for (var x = -1; x <= 1; x += 2)
+        {
+            for (var y = -1; y <= 1; y += 2)
+            {
+                for (var z = -1; z <= 1; z += 2)
+                {
+                    corners[index++] = bounds.center + new Vector3(
+                        bounds.extents.x * x, bounds.extents.y * y, bounds.extents.z * z);
+                }
+            }
+        }
+
+        return corners;
+    }
+
+    private void UpdateSimpleFishMotion(float deltaTime)
+    {
+        for (var i = 0; i < simpleFish.Count; i++)
+        {
+            var fish = simpleFish[i];
+            var currentFlow = smoothedTilt.x * 0.012f;
+            var cruise = FishCruiseSpeed * fish.speedFactor *
+                (0.72f + 0.4f * (0.5f + 0.5f * Mathf.Sin(elapsed * 0.5f + fish.phase)));
+
+            if (fish.fedCooldown > 0f)
+            {
+                fish.fedCooldown -= deltaTime;
+            }
+
+            // Flee: dart away from a recent nearby tap.
+            if (fish.fleeTime > 0f)
+            {
+                fish.fleeTime -= deltaTime;
+                fish.targetPellet = null;
+                var away = fish.position - fish.fleeFrom;
+                if (away.sqrMagnitude < 0.0004f)
+                {
+                    away = new Vector2(fish.direction > 0f ? 1f : -1f, 0f);
+                }
+                away.Normalize();
+                fish.position += away * (cruise * 3.4f) * deltaTime;
+                fish.position = ClampFishPosition(fish.position);
+                fish.direction = away.x >= 0f ? 1f : -1f;
+                continue;
+            }
+
+            // Feed: chase the nearest pellet when hungry.
+            if (fish.fedCooldown <= 0f && (fish.targetPellet == null || !fish.targetPellet.alive))
+            {
+                fish.targetPellet = FindNearestPellet(fish.position, PelletChaseRadius * 0.85f);
+            }
+
+            if (fish.fedCooldown > 0f)
+            {
+                fish.targetPellet = null;
+            }
+
+            if (fish.targetPellet != null)
+            {
+                var pelletPosition = fish.targetPellet.position;
+                var deltaX = pelletPosition.x - fish.position.x;
+                var deltaY = pelletPosition.y - fish.position.y;
+                var chaseSpeed = Mathf.Max(cruise * 2.3f, 0.07f);
+                fish.position.x = Mathf.MoveTowards(fish.position.x, pelletPosition.x, chaseSpeed * deltaTime);
+                fish.position.y = Mathf.MoveTowards(fish.position.y, pelletPosition.y, chaseSpeed * 0.85f * deltaTime);
+                fish.position = ClampFishPosition(fish.position);
+
+                if (Mathf.Abs(deltaX) < PelletEatRadius && Mathf.Abs(deltaY) < PelletEatRadius)
+                {
+                    fish.fedCooldown = SimpleFishFullCooldown;
+                    EatPellet(fish.targetPellet);
+                    fish.targetPellet = null;
+                }
+                fish.direction = deltaX >= 0f ? 1f : -1f;
+                continue;
+            }
+
+            if (i == 0)
+            {
+                UpdateSimpleFishLeader(fish, cruise, currentFlow, deltaTime);
+            }
+            else
+            {
+                // Each companion keeps its own forward swim cycle. The previous
+                // follower steering could settle at the leader's position after the
+                // separation pass pushed it away, which made most fish look frozen.
+                UpdateSimpleFishLeader(fish, cruise, currentFlow, deltaTime);
+            }
+        }
+    }
+
+    private void UpdateSimpleFishLeader(SimpleFish fish, float cruise, float currentFlow, float deltaTime)
+    {
+        // Occasional mid-water heading change and glides.
+        fish.nextTurnTime -= deltaTime;
+        if (fish.nextTurnTime <= 0f)
+        {
+            fish.nextTurnTime = UnityEngine.Random.Range(3f, 8f);
+            if (UnityEngine.Random.value < 0.45f)
+            {
+                fish.targetDirection = -fish.targetDirection;
+            }
+        }
+
+        fish.nextGlideTime -= deltaTime;
+        if (fish.nextGlideTime <= 0f)
+        {
+            fish.nextGlideTime = UnityEngine.Random.Range(5f, 12f);
+            fish.glideTime = UnityEngine.Random.Range(0.7f, 1.5f);
+        }
+
+        if (fish.glideTime > 0f)
+        {
+            fish.glideTime -= deltaTime;
+            cruise *= 0.26f;
+        }
+
+        if (fish.targetDirection > 0f && fish.position.x >= 1f - SimpleFishTurnMargin)
+        {
+            fish.targetDirection = -1f;
+        }
+        else if (fish.targetDirection < 0f && fish.position.x <= SimpleFishTurnMargin)
+        {
+            fish.targetDirection = 1f;
+        }
+
+        fish.direction = fish.targetDirection;
+
+        // Depth excursions.
+        fish.nextDepthTime -= deltaTime;
+        if (fish.nextDepthTime <= 0f)
+        {
+            fish.nextDepthTime = UnityEngine.Random.Range(4f, 9f);
+            fish.targetDepth = UnityEngine.Random.Range(0.12f, 0.95f);
+        }
+
+        fish.depth = Mathf.Lerp(fish.depth, fish.targetDepth, 1f - Mathf.Exp(-0.4f * deltaTime));
+
+        // Vertical: gentle bob around a slowly drifting band.
+        var targetY = fish.baseY + Mathf.Sin(elapsed * 0.85f + fish.phase) * 0.03f;
+        fish.position.y = Mathf.Lerp(fish.position.y, targetY, 1f - Mathf.Exp(-2.2f * deltaTime));
+
+        // Horizontal speed follows the visual heading, so the fish slows while turning.
+        var yawRadians = fish.yaw * Mathf.Deg2Rad;
+        var headingX = Mathf.Cos(yawRadians);
+        var turnSlow = 0.35f + 0.65f * Mathf.Abs(headingX);
+        fish.position.x += (cruise + currentFlow) * turnSlow * Mathf.Sign(headingX) * deltaTime;
+        fish.position.x = Mathf.Clamp(fish.position.x, SimpleFishTurnMargin, 1f - SimpleFishTurnMargin);
+    }
+
+    private void ApplyEmperorSeparation()
+    {
+        if (simpleFish.Count == 0)
+        {
+            return;
+        }
+
+        // Keep every fish separated in the composited screen view. Use projected
+        // rectangular body bounds instead of large circles: circles overestimate
+        // the empty space around long fish and can pin the school in place.
+        for (var iteration = 0; iteration < FishSeparationIterations; iteration++)
+        {
+            var emperorExtents = EmperorScreenHalfExtents();
+            for (var i = 0; i < simpleFish.Count; i++)
+            {
+                ResolveEmperorSimplePair(fish.position, emperorExtents, simpleFish[i]);
+            }
+
+            for (var i = 0; i < simpleFish.Count; i++)
+            {
+                for (var j = i + 1; j < simpleFish.Count; j++)
+                {
+                    ResolveSimpleFishPair(simpleFish[i], simpleFish[j]);
+                }
+            }
+        }
+    }
+
+    private Vector2 EmperorScreenHalfExtents()
+    {
+        var scale = FishViewScale(fish.depth);
+        var aspect = (float)fishRenderSize.x / Mathf.Max(1, fishRenderSize.y);
+        var worldWidth = FishCameraSize * 2f * aspect * scale;
+        var worldHeight = FishCameraSize * 2f * scale;
+        var halfLength = fishLocalLength > 0.0001f
+            ? fishLocalLength * fishRoot.transform.localScale.x * 0.5f
+            : worldWidth * EmperorLengthFraction * 0.5f;
+        var halfHeight = fishLocalHeight > 0.0001f
+            ? fishLocalHeight * fishRoot.transform.localScale.x * 0.5f
+            : halfLength * 0.42f;
+        return new Vector2(
+            halfLength / Mathf.Max(0.001f, worldWidth) + FishSeparationPadding,
+            halfHeight / Mathf.Max(0.001f, worldHeight) + FishSeparationPadding);
+    }
+
+    private Vector2 SimpleFishScreenHalfExtents(SimpleFish fish)
+    {
+        var scale = FishViewScale(fish.depth);
+        var aspect = (float)fishRenderSize.x / Mathf.Max(1, fishRenderSize.y);
+        var worldWidth = FishCameraSize * 2f * aspect * scale;
+        var worldHeight = FishCameraSize * 2f * scale;
+        return new Vector2(
+            fish.worldHalfLength / Mathf.Max(0.001f, worldWidth) + FishSeparationPadding,
+            fish.worldHalfHeight / Mathf.Max(0.001f, worldHeight) + FishSeparationPadding);
+    }
+
+    private void ResolveEmperorSimplePair(Vector2 fixedPosition, Vector2 fixedExtents,
+        SimpleFish movingFish)
+    {
+        ResolveAabbPair(fixedPosition, fixedExtents, movingFish, SimpleFishScreenHalfExtents(movingFish));
+    }
+
+    private void ResolveSimpleFishPair(SimpleFish first, SimpleFish second)
+    {
+        var firstExtents = SimpleFishScreenHalfExtents(first);
+        var secondExtents = SimpleFishScreenHalfExtents(second);
+        ResolveAabbPair(first.position, firstExtents, second, secondExtents);
+    }
+
+    private void ResolveAabbPair(Vector2 fixedPosition, Vector2 fixedExtents,
+        SimpleFish movingFish, Vector2 movingExtents)
+    {
+        var delta = movingFish.position - fixedPosition;
+        var overlapX = fixedExtents.x + movingExtents.x - Mathf.Abs(delta.x);
+        var overlapY = fixedExtents.y + movingExtents.y - Mathf.Abs(delta.y);
+        if (overlapX <= 0f || overlapY <= 0f)
+        {
+            return;
+        }
+
+        // Resolve along the shallowest penetration so the fish keep swimming in the
+        // other axis instead of being repeatedly stopped in the travel direction.
+        if (overlapX < overlapY)
+        {
+            var directionX = delta.x >= 0f ? 1f : -1f;
+            if (Mathf.Abs(delta.x) < 0.0001f)
+            {
+                directionX = 1f;
+            }
+            movingFish.position.x = fixedPosition.x +
+                directionX * (fixedExtents.x + movingExtents.x);
+        }
+        else
+        {
+            var directionY = delta.y >= 0f ? 1f : -1f;
+            if (Mathf.Abs(delta.y) < 0.0001f)
+            {
+                directionY = 1f;
+            }
+            movingFish.position.y = fixedPosition.y +
+                directionY * (fixedExtents.y + movingExtents.y);
+        }
+
+        movingFish.position = ClampFishPosition(movingFish.position);
+    }
+
+    private void UpdateSimpleFishFollower(SimpleFish fish, SimpleFish leader, float cruise, float deltaTime)
+    {
+        // Trail the leader from behind with a personal offset and gentle wobble.
+        var desired = new Vector2(
+            leader.position.x - leader.direction * fish.schoolOffset.x,
+            leader.position.y + fish.schoolOffset.y);
+        desired.x += Mathf.Sin(elapsed * 1.1f + fish.phase) * 0.016f;
+        desired.y += Mathf.Cos(elapsed * 0.9f + fish.phase) * 0.012f;
+
+        // Simple separation so followers do not stack on each other.
+        for (var j = 0; j < simpleFish.Count; j++)
+        {
+            var other = simpleFish[j];
+            if (other == fish)
+            {
+                continue;
+            }
+
+            var diff = fish.position - other.position;
+            var distance = diff.magnitude;
+            if (distance < 0.085f && distance > 0.0001f)
+            {
+                desired += diff / distance * (0.085f - distance) * 2.0f;
+            }
+        }
+
+        var steer = Mathf.Max(cruise * 2.2f, 0.05f);
+        fish.position.x = Mathf.MoveTowards(fish.position.x, desired.x, steer * deltaTime);
+        fish.position.y = Mathf.MoveTowards(fish.position.y, desired.y, steer * 0.85f * deltaTime);
+        fish.position = ClampFishPosition(fish.position);
+
+        // Follow the leader's depth loosely, with a personal offset.
+        fish.targetDepth = leader.depth + fish.depthOffset;
+        fish.depth = Mathf.Lerp(fish.depth, fish.targetDepth, 1f - Mathf.Exp(-1.1f * deltaTime));
+
+        fish.direction = desired.x >= fish.position.x ? 1f : -1f;
+    }
+
+    private void UpdateSimpleFishModel()
+    {
+        if (fishRenderSize.x <= 0)
+        {
+            return;
+        }
+
+        for (var i = 0; i < simpleFish.Count; i++)
+        {
+            var fish = simpleFish[i];
+            var freeSwimming = fish.fleeTime <= 0f && fish.targetPellet == null;
+            PlaceFishAt(fish.root.transform, fish.position, fish.depth,
+                fish.worldHalfLength, ref fish.direction, ref fish.targetDirection, freeSwimming);
+
+            // Smooth yaw turn with banking roll and nose pitch.
+            var yawTarget = fish.direction > 0f ? 0f : 180f;
+            fish.yaw = Mathf.MoveTowardsAngle(fish.yaw, yawTarget, FishTurnYawSpeed * Time.deltaTime);
+            var turnRate = Mathf.DeltaAngle(fish.yaw, yawTarget);
+            var bank = Mathf.Clamp(turnRate * FishBankStrength, -FishBankMax, FishBankMax);
+            var pitch = Mathf.Clamp(-Mathf.Cos(elapsed * 0.85f + fish.phase) * 5f, -8f, 8f);
+            fish.pivot.transform.localRotation =
+                Quaternion.Euler(0f, fish.yaw, 0f) *
+                Quaternion.Euler(0f, 0f, pitch) *
+                Quaternion.Euler(bank, 0f, 0f);
+        }
+    }
+
+    private void RenderFish()
+    {
+        if (fishCamera == null || fishRenderTexture == null || fishRenderTextureBack == null)
+        {
+            return;
+        }
+
+        if (!fishRenderTexture.IsCreated())
+        {
+            fishRenderTexture.Create();
+        }
+
+        if (!fishRenderTextureBack.IsCreated())
+        {
+            fishRenderTextureBack.Create();
+        }
+
+        // Never render into the texture sampled by OnGUI. This prevents a shared
+        // all-fish blink when the Android tile renderer resolves the render target.
+        fishCamera.targetTexture = fishRenderTextureBack;
+        var previousActive = RenderTexture.active;
+        RenderTexture.active = fishRenderTextureBack;
+        GL.Clear(true, true, Color.clear);
         fishCamera.Render();
+
+        // Swap references only after the camera has completed its frame. Avoiding a
+        // Graphics.Blit here removes the extra GPU resolve/copy that could expose a
+        // partially updated all-fish texture on the phone.
+        var completedFrame = fishRenderTextureBack;
+        fishRenderTextureBack = fishRenderTexture;
+        fishRenderTexture = completedFrame;
+        fishCamera.targetTexture = fishRenderTextureBack;
+        RenderTexture.active = previousActive;
     }
 
     private static Texture2D CreateGlowTexture(int size)
@@ -937,10 +2208,26 @@ public sealed class HelloAndroid : MonoBehaviour
             Destroy(fishRoot);
         }
 
+        if (simpleFishParent != null)
+        {
+            Destroy(simpleFishParent);
+        }
+
+        if (pelletsParent != null)
+        {
+            Destroy(pelletsParent);
+        }
+
         if (fishRenderTexture != null)
         {
             fishRenderTexture.Release();
             Destroy(fishRenderTexture);
+        }
+
+        if (fishRenderTextureBack != null)
+        {
+            fishRenderTextureBack.Release();
+            Destroy(fishRenderTextureBack);
         }
 
         if (rippleClip != null)
